@@ -1,0 +1,21 @@
+# General ignores
+.DS_Store
+.env
+.vscode/
+
+# Pine Script specific ignores (if any, though usually not needed for single .pine files)
+# *.pine.bak
+# *.pinescript.tmp
+
+# Backup files
+*~
+*.bak
+*.tmp
+
+# Logs and other generated files
+logs/
+*.log
+*.out
+
+# Operating System files
+Thumbs.db

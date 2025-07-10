@@ -1,0 +1,237 @@
+//@version=6
+indicator(title="Uniswap V3 Liquidity Range (Enhanced)", shorttitle="UniV3 LP", overlay=true)
+
+// —————————————————————————————————————————————————————————————————————————————————————————————————
+//
+//                                  Uniswap V3 Liquidity Range (Enhanced)
+//
+//    This script provides dynamic, volatility-based liquidity ranges for Uniswap V3. It includes
+//    proactive signals for rebalancing, advanced volatility models, and a comprehensive dashboard
+//    to help liquidity providers optimize their strategies.
+//
+// —————————————————————————————————————————————————————————————————————————————————————————————————
+
+// --- Color Palette ---
+color_active_range_fill = color.new(color.blue, 85)
+color_active_range_border = color.new(color.blue, 50)
+color_preview_range_fill = color.new(color.orange, 90)
+color_preview_range_border = color.new(color.orange, 50)
+color_fib = color.new(color.teal, 50)
+color_proactive_label = color.new(color.yellow, 20)
+color_rebalance_label = color.new(color.red, 25)
+
+// --- Inputs ---
+// General Settings
+group_general = "General Settings"
+i_N = input.int(30, title="Volatility Window Size", minval=1, group=group_general, tooltip="A larger window creates a smoother, less reactive volatility measure. A smaller window is more sensitive to recent price swings.")
+i_K = input.float(6.28, title="Multiplier", minval=0, group=group_general, tooltip="Controls the width of the liquidity range. A larger value creates a wider range, offering more safety but potentially lower fee returns.")
+i_decimals = input.int(4, title="Price Decimals", minval=0, maxval=8, group=group_general)
+i_show_preview_range = input.bool(true, title="Show Preview Range", group=group_general, tooltip="Show a hypothetical range based on the current price and volatility.")
+
+// Proactive Rebalance Strategy
+group_proactive = "Proactive Rebalance Strategy"
+i_proactive_signal_enabled = input.bool(true, title="Enable Proactive Rebalance Signal", group=group_proactive)
+i_proactive_middle_dev_pct = input.float(25.0, title="Middle Deviation % for Signal", minval=0, step=1, group=group_proactive, tooltip="Trigger signal if current price deviates from active middle by this % of active range width.")
+i_proactive_width_diff_pct = input.float(30.0, title="Width Difference % for Signal", minval=0, step=1, group=group_proactive, tooltip="Trigger signal if preview range width differs from active range width by this %.")
+
+// Advanced Settings
+group_advanced = "Advanced Settings"
+i_volatility_model = input.string("EWMA", title="Volatility Model", options=["EWMA", "Standard Deviation"], group=group_advanced, tooltip="EWMA gives more weight to recent data, making volatility more responsive. Standard Deviation gives equal weight to all data in the window.")
+
+// UI Settings
+group_ui = "UI Settings"
+i_table_position = input.string("top_right", title="Table Position", options=["top_left", "top_right", "bottom_left", "bottom_right", "middle_left", "middle_right"], group=group_ui)
+i_duration_display_unit = input.string("Auto", title="Rebalance Duration Unit", options=["Auto", "Weeks", "Days", "Hours", "Minutes"], group=group_ui, tooltip="Choose how the duration of each range is displayed on the rebalance label.")
+i_max_labels_count = input.int(5, title="Max Rebalance Labels", minval=0, group=group_ui, tooltip="The maximum number of historical rebalance labels to display. Set to 0 to hide all.")
+
+// --- Helper Functions ---
+f_get_price_format(num_decimals) =>
+    string fmt = "0."
+    if num_decimals == 0
+        fmt := "0"
+    else
+        for i = 1 to num_decimals
+            fmt := fmt + "0"
+    fmt
+
+f_format_duration(total_seconds, unit_preference) =>
+    string result = "<1s"
+    if total_seconds >= 1.0
+        switch unit_preference
+            "Weeks"   => result := str.tostring(math.round(total_seconds / 604800.0, 1)) + "w"
+            "Days"    => result := str.tostring(math.round(total_seconds / 86400.0, 1)) + "d"
+            "Hours"   => result := str.tostring(math.round(total_seconds / 3600.0, 1)) + "h"
+            "Minutes" => result := str.tostring(math.round(total_seconds / 60.0, 0)) + "m"
+            =>
+                float days_raw = total_seconds / 86400.0
+                if days_raw / 7.0 >= 1.0
+                    result := str.tostring(math.round(days_raw / 7.0, 1)) + "w"
+                else if days_raw >= 1.0
+                    result := str.tostring(math.round(days_raw, 1)) + "d"
+                else
+                    float hours_raw = total_seconds / 3600.0
+                    if hours_raw >= 1.0
+                        result := str.tostring(math.round(hours_raw, 1)) + "h"
+                    else
+                        result := str.tostring(math.round(total_seconds / 60.0, 0)) + "m"
+    result
+
+f_calculate_sigma(model, source, length) =>
+    log_return = math.log(source / source[1])
+    if model == "EWMA"
+        sq_log_return = log_return * log_return
+        ewma_sq_log_return = ta.ema(sq_log_return, length)
+        math.sqrt(ewma_sq_log_return)
+    else
+        ta.stdev(log_return, length)
+
+f_check_proactive_rebalance(proactive_enabled, preview_enabled, active_mid, active_low, active_upp, preview_mid, preview_low, preview_upp, dev_pct, width_pct, price_format_str) =>
+    bool trigger = false
+    string reason = ""
+    string range_text = ""
+    if proactive_enabled and preview_enabled and not na(active_mid) and not na(preview_mid) and (close < active_upp and close > active_low)
+        active_range_width = active_upp - active_low
+        preview_range_width = preview_upp - preview_low
+        if active_range_width > 0
+            middle_deviation = math.abs(active_mid - preview_mid)
+            middle_deviation_as_pct_of_width = (middle_deviation / active_range_width) * 100
+            if middle_deviation_as_pct_of_width >= dev_pct
+                trigger := true
+                reason := "Mid Dev: " + str.tostring(math.round(middle_deviation_as_pct_of_width, 1)) + "%"
+        if not trigger and active_range_width > 0 and preview_range_width > 0
+            width_difference = math.abs(preview_range_width - active_range_width)
+            width_difference_as_pct_of_active = (width_difference / active_range_width) * 100
+            if width_difference_as_pct_of_active >= width_pct
+                trigger := true
+                reason := (preview_range_width > active_range_width ? "Wider Preview: " : "Narrower Preview: ") + str.tostring(math.round(width_difference_as_pct_of_active, 1)) + "%"
+    if trigger
+        range_text := "\n" + "New Mid: " + str.tostring(preview_mid, price_format_str) + "\n" + "New Low: " + str.tostring(preview_low, price_format_str) + "\n" + "New Upp: " + str.tostring(preview_upp, price_format_str)
+    [trigger, reason, range_text]
+
+// --- Calculations ---
+price_format = f_get_price_format(i_decimals)
+sigma = f_calculate_sigma(i_volatility_model, close, i_N)
+
+// Declare persistent variables
+var float middle = na, var float lower = na, var float upper = na
+var float fib236 = na, var float fib382 = na, var float fib618 = na, var float fib786 = na
+var float entry_price_on_rebalance = na
+var int prev_rebalance_time_ms = na
+var bool forced_rebalance_this_bar = false
+var label[] rebalance_labels = array.new_label()
+var float[] duration_history = array.new_float()
+var float avg_duration_secs = na
+
+// Preview Range Calculation
+preview_middle = i_show_preview_range and not na(sigma) ? close : na
+preview_lower = i_show_preview_range and not na(sigma) ? close * math.exp(-i_K * sigma) : na
+preview_upper = i_show_preview_range and not na(sigma) ? close * math.exp(i_K * sigma) : na
+
+// --- Rebalance Logic ---
+forced_rebalance_this_bar := false
+if not na(sigma)
+    if na(middle) or close > upper or close < lower
+        middle := close
+        lower := middle * math.exp(-i_K * sigma)
+        upper := middle * math.exp(i_K * sigma)
+        fib236 := middle * math.exp(i_K * sigma * (2 * 0.236 - 1))
+        fib382 := middle * math.exp(i_K * sigma * (2 * 0.382 - 1))
+        fib618 := middle * math.exp(i_K * sigma * (2 * 0.618 - 1))
+        fib786 := middle * math.exp(i_K * sigma * (2 * 0.786 - 1))
+        entry_price_on_rebalance := middle
+        forced_rebalance_this_bar := true
+        
+        current_rebalance_time_ms = time
+        string duration_info_for_label = "\n(Initial Range)"
+        if not na(prev_rebalance_time_ms)
+            duration_ms = current_rebalance_time_ms - prev_rebalance_time_ms
+            if duration_ms > 0
+                total_seconds_elapsed = duration_ms / 1000.0
+                duration_info_for_label := "\nLasted: " + f_format_duration(total_seconds_elapsed, i_duration_display_unit)
+                array.push(duration_history, total_seconds_elapsed)
+                if array.size(duration_history) > 20 // Keep last 20 durations
+                    array.shift(duration_history)
+                avg_duration_secs := array.avg(duration_history)
+
+        prev_rebalance_time_ms := current_rebalance_time_ms
+        
+        if i_max_labels_count > 0
+            label_text = "Rebalance\nEntry: " + str.tostring(middle, price_format) + duration_info_for_label
+            new_label = label.new(bar_index, high, label_text, color=color_rebalance_label, textcolor=color.white, style=label.style_label_down)
+            array.push(rebalance_labels, new_label)
+            if array.size(rebalance_labels) > i_max_labels_count
+                label.delete(array.shift(rebalance_labels))
+
+// --- Proactive Signal Logic ---
+[trigger_proactive_signal, proactive_signal_reason, proactive_range_info] = f_check_proactive_rebalance(i_proactive_signal_enabled, i_show_preview_range, middle, lower, upper, preview_middle, preview_lower, preview_upper, i_proactive_middle_dev_pct, i_proactive_width_diff_pct, price_format)
+
+if trigger_proactive_signal and not forced_rebalance_this_bar
+    full_proactive_label_text = "Proactive?\n" + proactive_signal_reason + proactive_range_info
+    label.new(bar_index, low - (high - low) * 0.1, full_proactive_label_text, color=color_proactive_label, textcolor=color.black, style=label.style_label_up, tooltip="Consider proactive rebalance. Current range may be off-center or misaligned with current volatility.")
+alertcondition(trigger_proactive_signal, title="Proactive Rebalance Signal", message="Uniswap V3: Consider proactive rebalance.")
+
+// --- Plotting ---
+// Active Range
+lower_plot = plot(lower, title="Lower Band", color=color_active_range_border, style=plot.style_line)
+upper_plot = plot(upper, title="Upper Band", color=color_active_range_border, style=plot.style_line)
+fill(lower_plot, upper_plot, color=color_active_range_fill, title="Active Range Fill")
+plot(middle, title="Middle", color=color_active_range_border, style=plot.style_linebr)
+plot(entry_price_on_rebalance, title="Entry Price", color=color.new(color.purple, 0), style=plot.style_linebr, linewidth=2)
+
+// Fibonacci Levels
+plot(fib236, title="Fib 23.6%", color=color_fib, style=plot.style_linebr)
+plot(fib382, title="Fib 38.2%", color=color_fib, style=plot.style_linebr)
+plot(fib618, title="Fib 61.8%", color=color_fib, style=plot.style_linebr)
+plot(fib786, title="Fib 78.6%", color=color_fib, style=plot.style_linebr)
+
+// Preview Range
+preview_lower_plot = plot(i_show_preview_range ? preview_lower : na, title="Preview Lower", color=color_preview_range_border, style=plot.style_line, linewidth=1)
+preview_upper_plot = plot(i_show_preview_range ? preview_upper : na, title="Preview Upper", color=color_preview_range_border, style=plot.style_line, linewidth=1)
+plot(i_show_preview_range ? preview_middle : na, title="Preview Middle", color=color_preview_range_border, style=plot.style_line, linewidth=1)
+fill(preview_lower_plot, preview_upper_plot, color=color_preview_range_fill, title="Preview Range Fill")
+
+// --- Table Display ---
+var table info_table = table.new(i_table_position, 2, 8, border_width=1)
+
+if barstate.islast
+    // Determine Status
+    string status_text = ""
+    color status_color = na
+    if close > upper or close < lower
+        status_text := "Out of Range"
+        status_color := color.new(color.red, 80)
+    else if trigger_proactive_signal
+        status_text := "Proactive Signal"
+        status_color := color.new(color.yellow, 80)
+    else
+        status_text := "In Range"
+        status_color := color.new(color.green, 80)
+
+    // Update table position
+    table.set_position(info_table, i_table_position)
+
+    // Populate Table
+    // Active Range
+    table.cell(info_table, 0, 0, "Upper", text_halign=text.align_left)
+    table.cell(info_table, 1, 0, str.tostring(upper, price_format), text_halign=text.align_right)
+    table.cell(info_table, 0, 1, "Entry", text_halign=text.align_left)
+    table.cell(info_table, 1, 1, str.tostring(entry_price_on_rebalance, price_format), text_halign=text.align_right)
+    table.cell(info_table, 0, 2, "Lower", text_halign=text.align_left)
+    table.cell(info_table, 1, 2, str.tostring(lower, price_format), text_halign=text.align_right)
+    
+    // Preview Range
+    table.cell(info_table, 0, 3, i_show_preview_range ? "Preview Upper" : "", text_halign=text.align_left, text_color=color.gray)
+    table.cell(info_table, 1, 3, i_show_preview_range ? str.tostring(preview_upper, price_format) : "", text_halign=text.align_right, text_color=color.gray)
+    table.cell(info_table, 0, 4, i_show_preview_range ? "Preview Middle" : "", text_halign=text.align_left, text_color=color.gray)
+    table.cell(info_table, 1, 4, i_show_preview_range ? str.tostring(preview_middle, price_format) : "", text_halign=text.align_right, text_color=color.gray)
+    table.cell(info_table, 0, 5, i_show_preview_range ? "Preview Lower" : "", text_halign=text.align_left, text_color=color.gray)
+    table.cell(info_table, 1, 5, i_show_preview_range ? str.tostring(preview_lower, price_format) : "", text_halign=text.align_right, text_color=color.gray)
+
+    // Status
+    table.cell(info_table, 0, 6, "Status", text_halign=text.align_left, bgcolor=status_color)
+    table.cell(info_table, 1, 6, status_text, text_halign=text.align_right, bgcolor=status_color)
+
+    // Average Duration
+    avg_duration_str = na(avg_duration_secs) ? "N/A" : f_format_duration(avg_duration_secs, i_duration_display_unit)
+    table.cell(info_table, 0, 7, "Avg. Duration", text_halign=text.align_left)
+    table.cell(info_table, 1, 7, avg_duration_str, text_halign=text.align_right)
