@@ -6,7 +6,7 @@
 
 Easily customize the indicator's behavior and appearance through its intuitive settings. Below is a screenshot of the input parameters:
 
-![Uniswap V3 Liquidity Range Indicator Setup Inputs](setup inputs.png)
+![Uniswap V3 Liquidity Range Indicator Setup Inputs](setup_inputs.png)
 
 ## Overview
 
