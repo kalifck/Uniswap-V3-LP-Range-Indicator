@@ -26,7 +26,7 @@ group_general = "General Settings"
 i_N = input.int(30, title="Volatility Window Size", minval=1, group=group_general, tooltip="A larger window creates a smoother, less reactive volatility measure. A smaller window is more sensitive to recent price swings.")
 i_K = input.float(6.28, title="Multiplier", minval=0, group=group_general, tooltip="Controls the width of the liquidity range. A larger value creates a wider range, offering more safety but potentially lower fee returns.")
 i_decimals = input.int(4, title="Price Decimals", minval=0, maxval=8, group=group_general)
-i_show_preview_range = input.bool(true, title="Show Preview Range", group=group_general, tooltip="Show a hypothetical range based on the current price and volatility.")
+i_show_preview_range = input.bool(true, title="Show Preview Range", group=group_general, tooltip="Show a hypothetical range based on the current price and volatility, including its background fill.")
 
 // Proactive Rebalance Strategy
 group_proactive = "Proactive Rebalance Strategy"
@@ -37,14 +37,51 @@ i_proactive_width_diff_pct = input.float(30.0, title="Width Difference % for Sig
 // Advanced Settings
 group_advanced = "Advanced Settings"
 i_volatility_model = input.string("EWMA", title="Volatility Model", options=["EWMA", "Standard Deviation"], group=group_advanced, tooltip="EWMA gives more weight to recent data, making volatility more responsive. Standard Deviation gives equal weight to all data in the window.")
+i_volume_lookback_bars = input.int(200, title="Volume Comparison Period (Bars)", group=group_advanced, minval=1, tooltip="The lookback period for comparing current volume to previous volume.")
 
 // UI Settings
 group_ui = "UI Settings"
 i_table_position = input.string("top_right", title="Table Position", options=["top_left", "top_right", "bottom_left", "bottom_right", "middle_left", "middle_right"], group=group_ui)
 i_duration_display_unit = input.string("Auto", title="Rebalance Duration Unit", options=["Auto", "Weeks", "Days", "Hours", "Minutes"], group=group_ui, tooltip="Choose how the duration of each range is displayed on the rebalance label.")
 i_max_labels_count = input.int(5, title="Max Rebalance Labels", minval=0, group=group_ui, tooltip="The maximum number of historical rebalance labels to display. Set to 0 to hide all.")
+i_enable_volume_viz = input.bool(true, "Enable Volume Visualization", group=group_ui)
+i_volume_viz_sensitivity = input.float(50.0, "Volume Sensitivity %", group=group_ui, minval=1, maxval=100, tooltip="Controls how quickly the range color intensifies with volume. Higher % = less sensitive.")
+i_show_volume_bars = input.bool(false, "Show On-Chart Volume Bars", group=group_ui, tooltip="Toggles the display of a traditional volume histogram on the main chart.")
+
+
+// Fibonacci Settings
+group_fib = "Fibonacci Settings"
+i_fib_show = input.bool(true, "Show Manual Fibonacci", group=group_fib)
+i_fib_p1_time = input.time(timestamp("2023-01-01T00:00:00"), "Point 1 Time", group=group_fib)
+i_fib_p1_price = input.price(1.0, "Point 1 Price", group=group_fib)
+i_fib_p2_time = input.time(timestamp("2023-01-02T00:00:00"), "Point 2 Time", group=group_fib)
+i_fib_p2_price = input.price(2.0, "Point 2 Price", group=group_fib)
+
+// Manual Support/Resistance Settings
+group_sr = "Manual Support/Resistance"
+i_enable_sr = input.bool(false, "Enable S/R Anchoring", group=group_sr, tooltip="When enabled, rebalances will try to anchor to defined S/R levels.")
+i_sr_level_1 = input.price(0.0, "S/R Level 1", group=group_sr)
+i_sr_level_2 = input.price(0.0, "S/R Level 2", group=group_sr)
+i_sr_level_3 = input.price(0.0, "S/R Level 3", group=group_sr)
+i_sr_level_4 = input.price(0.0, "S/R Level 4", group=group_sr)
+i_sr_level_5 = input.price(0.0, "S/R Level 5", group=group_sr)
+i_sr_buffer_pct = input.float(0.1, "S/R Buffer %", group=group_sr, minval=0.01, maxval=5.0, step=0.01, tooltip="Percentage buffer around S/R levels to define a zone.")
+i_max_sr_anchor_distance_pct = input.float(5.0, "Max S/R Anchor Distance %", group=group_sr, minval=0.1, maxval=100.0, step=0.1, tooltip="Maximum percentage distance from current price for an S/R level to be considered for anchoring.")
+
 
 // --- Helper Functions ---
+f_format_volume(vol) =>
+    string result = ""
+    if vol >= 1000000000
+        result := str.tostring(math.round(vol / 1000000000, 2)) + "B"
+    else if vol >= 1000000
+        result := str.tostring(math.round(vol / 1000000, 2)) + "M"
+    else if vol >= 1000
+        result := str.tostring(math.round(vol / 1000, 2)) + "K"
+    else
+        result := str.tostring(math.round(vol, 2))
+    result
+
 f_get_price_format(num_decimals) =>
     string fmt = "0."
     if num_decimals == 0
@@ -108,19 +145,42 @@ f_check_proactive_rebalance(proactive_enabled, preview_enabled, active_mid, acti
         range_text := "\n" + "New Mid: " + str.tostring(preview_mid, price_format_str) + "\n" + "New Low: " + str.tostring(preview_low, price_format_str) + "\n" + "New Upp: " + str.tostring(preview_upp, price_format_str)
     [trigger, reason, range_text]
 
+f_plot_sr_level(price, buffer_pct) =>
+    float sr_level = na
+    float sr_upper_buffer = na
+    float sr_lower_buffer = na
+    if not na(price) and price != 0.0
+        buffer_amount = price * (buffer_pct / 100)
+        sr_level := price
+        sr_upper_buffer := price + buffer_amount
+        sr_lower_buffer := price - buffer_amount
+    [sr_level, sr_upper_buffer, sr_lower_buffer]
+
+f_is_price_in_sr_zone(price, sr_level, buffer_pct) =>
+    is_in_zone = false
+    if not na(sr_level)
+        buffer_amount = sr_level * (buffer_pct / 100)
+        if price >= (sr_level - buffer_amount) and price <= (sr_level + buffer_amount)
+            is_in_zone := true
+    is_in_zone
+
 // --- Calculations ---
 price_format = f_get_price_format(i_decimals)
 sigma = f_calculate_sigma(i_volatility_model, close, i_N)
+current_period_total_volume = math.sum(volume, i_volume_lookback_bars)
+previous_period_total_volume = math.sum(volume[i_volume_lookback_bars], i_volume_lookback_bars)
 
 // Declare persistent variables
 var float middle = na, var float lower = na, var float upper = na
-var float fib236 = na, var float fib382 = na, var float fib618 = na, var float fib786 = na
 var float entry_price_on_rebalance = na
 var int prev_rebalance_time_ms = na
 var bool forced_rebalance_this_bar = false
 var label[] rebalance_labels = array.new_label()
 var float[] duration_history = array.new_float()
 var float avg_duration_secs = na
+var float cumulativeVolumeSinceRebalance = 0.0
+var float recent_range_avg_volume_per_bar = na
+var int barsSinceRebalance = 0
 
 // Preview Range Calculation
 preview_middle = i_show_preview_range and not na(sigma) ? close : na
@@ -131,16 +191,65 @@ preview_upper = i_show_preview_range and not na(sigma) ? close * math.exp(i_K * 
 forced_rebalance_this_bar := false
 if not na(sigma)
     if na(middle) or close > upper or close < lower
-        middle := close
+        // --- Capture metrics before reset ---
+        string volume_info_for_label = ""
+        if not na(middle) // Avoid adding volume info for the very first range
+            volume_info_for_label := "\nVol: " + f_format_volume(cumulativeVolumeSinceRebalance)
+            if barsSinceRebalance > 0
+                recent_range_avg_volume_per_bar := cumulativeVolumeSinceRebalance / barsSinceRebalance
+
+        // --- Reset for new range ---
+        cumulativeVolumeSinceRebalance := 0.0
+        barsSinceRebalance := 0
+        
+        float new_middle_candidate = close
+        if i_enable_sr
+            float best_sr_level = na
+            
+            // Collect valid S/R levels based on direction of break and filter out 0.0
+            sr_levels_to_consider = array.new_float()
+            if not na(i_sr_level_1) and i_sr_level_1 != 0.0
+                array.push(sr_levels_to_consider, i_sr_level_1)
+            if not na(i_sr_level_2) and i_sr_level_2 != 0.0
+                array.push(sr_levels_to_consider, i_sr_level_2)
+            if not na(i_sr_level_3) and i_sr_level_3 != 0.0
+                array.push(sr_levels_to_consider, i_sr_level_3)
+            if not na(i_sr_level_4) and i_sr_level_4 != 0.0
+                array.push(sr_levels_to_consider, i_sr_level_4)
+            if not na(i_sr_level_5) and i_sr_level_5 != 0.0
+                array.push(sr_levels_to_consider, i_sr_level_5)
+
+            if array.size(sr_levels_to_consider) > 0
+                if close > upper // Price broke above, look for resistance above current price
+                    float min_sr_above_close = 999999999999999.0 // A very large number
+                    for i = 0 to array.size(sr_levels_to_consider) - 1
+                        level = array.get(sr_levels_to_consider, i)
+                        if level > close
+                            min_sr_above_close := math.min(min_sr_above_close, level)
+                    if min_sr_above_close != 999999999999999.0
+                        best_sr_level := min_sr_above_close
+                else if close < lower // Price broke below, look for support below current price
+                    float max_sr_below_close = -999999999999999.0 // A very small number
+                    for i = 0 to array.size(sr_levels_to_consider) - 1
+                        level = array.get(sr_levels_to_consider, i)
+                        if level < close
+                            max_sr_below_close := math.max(max_sr_below_close, level)
+                    if max_sr_below_close != -999999999999999.0
+                        best_sr_level := max_sr_below_close
+            
+            // Proximity check
+            if not na(best_sr_level)
+                float distance_pct = math.abs(best_sr_level - close) / close * 100
+                if distance_pct <= i_max_sr_anchor_distance_pct
+                    new_middle_candidate := best_sr_level
+
+        middle := new_middle_candidate
         lower := middle * math.exp(-i_K * sigma)
         upper := middle * math.exp(i_K * sigma)
-        fib236 := middle * math.exp(i_K * sigma * (2 * 0.236 - 1))
-        fib382 := middle * math.exp(i_K * sigma * (2 * 0.382 - 1))
-        fib618 := middle * math.exp(i_K * sigma * (2 * 0.618 - 1))
-        fib786 := middle * math.exp(i_K * sigma * (2 * 0.786 - 1))
         entry_price_on_rebalance := middle
         forced_rebalance_this_bar := true
         
+        // --- Handle rebalance labels and duration history ---
         current_rebalance_time_ms = time
         string duration_info_for_label = "\n(Initial Range)"
         if not na(prev_rebalance_time_ms)
@@ -156,11 +265,16 @@ if not na(sigma)
         prev_rebalance_time_ms := current_rebalance_time_ms
         
         if i_max_labels_count > 0
-            label_text = "Rebalance\nEntry: " + str.tostring(middle, price_format) + duration_info_for_label
+            label_text = "Rebalance\nEntry: " + str.tostring(middle, price_format) + duration_info_for_label + volume_info_for_label
             new_label = label.new(bar_index, high, label_text, color=color_rebalance_label, textcolor=color.white, style=label.style_label_down)
             array.push(rebalance_labels, new_label)
             if array.size(rebalance_labels) > i_max_labels_count
                 label.delete(array.shift(rebalance_labels))
+
+// --- Accumulate metrics if in an active range ---
+if not na(middle) and close <= upper and close >= lower
+    cumulativeVolumeSinceRebalance += nz(volume)
+    barsSinceRebalance += 1
 
 // --- Proactive Signal Logic ---
 [trigger_proactive_signal, proactive_signal_reason, proactive_range_info] = f_check_proactive_rebalance(i_proactive_signal_enabled, i_show_preview_range, middle, lower, upper, preview_middle, preview_lower, preview_upper, i_proactive_middle_dev_pct, i_proactive_width_diff_pct, price_format)
@@ -170,28 +284,184 @@ if trigger_proactive_signal and not forced_rebalance_this_bar
     label.new(bar_index, low - (high - low) * 0.1, full_proactive_label_text, color=color_proactive_label, textcolor=color.black, style=label.style_label_up, tooltip="Consider proactive rebalance. Current range may be off-center or misaligned with current volatility.")
 alertcondition(trigger_proactive_signal, title="Proactive Rebalance Signal", message="Uniswap V3: Consider proactive rebalance.")
 
+// --- Manual Fibonacci Drawing ---
+var line[] fib_lines = array.new_line()
+var label[] fib_labels = array.new_label()
+
+// Track the settings used for the current drawings
+var int p1_time_drawn = na
+var float p1_price_drawn = na
+var int p2_time_drawn = na
+var float p2_price_drawn = na
+
+// Check if settings have changed
+bool settings_changed = p1_time_drawn != i_fib_p1_time or p1_price_drawn != i_fib_p1_price or p2_time_drawn != i_fib_p2_time or p2_price_drawn != i_fib_p2_price
+
+if i_fib_show
+    if settings_changed
+        // Settings have changed, clear old drawings
+        if array.size(fib_lines) > 0
+            for i = 0 to array.size(fib_lines) - 1
+                line.delete(array.get(fib_lines, i))
+            array.clear(fib_lines)
+
+        if array.size(fib_labels) > 0
+            for i = 0 to array.size(fib_labels) - 1
+                label.delete(array.get(fib_labels, i))
+            array.clear(fib_labels)
+
+        // Draw new lines
+        swing_high = math.max(i_fib_p1_price, i_fib_p2_price)
+        swing_low = math.min(i_fib_p1_price, i_fib_p2_price)
+        price_range = swing_high - swing_low
+
+        if price_range > 0
+            fib_levels = array.from(0, 0.236, 0.382, 0.5, 0.618, 0.786, 1, -0.27, -0.618)
+            line_start_time = math.min(i_fib_p1_time, i_fib_p2_time)
+
+            for i = 0 to array.size(fib_levels) - 1
+                level = array.get(fib_levels, i)
+                price_level = i_fib_p1_price > i_fib_p2_price ? (swing_high - price_range * level) : (swing_low + price_range * level)
+
+                fib_line = line.new(line_start_time, price_level, time, price_level, color=color_fib, style=line.style_dashed, width=1, extend=extend.right)
+                array.push(fib_lines, fib_line)
+
+                fib_label = label.new(time, price_level, str.tostring(level * 100, "#.00") + "%", color=color.new(color.black, 100), textcolor=color.white, style=label.style_label_left, xloc=xloc.bar_time)
+                array.push(fib_labels, fib_label)
+
+        // Update the drawn state
+        p1_time_drawn := i_fib_p1_time
+        p1_price_drawn := i_fib_p1_price
+        p2_time_drawn := i_fib_p2_time
+        p2_price_drawn := i_fib_p2_price
+
+    // On every bar, if lines exist and settings have NOT changed, extend them
+    else if array.size(fib_lines) > 0
+        for i = 0 to array.size(fib_lines) - 1
+            line.set_x2(array.get(fib_lines, i), time)
+            if i < array.size(fib_labels)
+                label.set_x(array.get(fib_labels, i), time)
+else
+    // Hide drawings if checkbox is unchecked
+    if array.size(fib_lines) > 0
+        for i = 0 to array.size(fib_lines) - 1
+            line.delete(array.get(fib_lines, i))
+        array.clear(fib_lines)
+    if array.size(fib_labels) > 0
+        for i = 0 to array.size(fib_labels) - 1
+            label.delete(array.get(fib_labels, i))
+        array.clear(fib_labels)
+
 // --- Plotting ---
 // Active Range
+// Calculate dynamic fill color based on volume
+color dynamic_fill_color = color_active_range_fill
+if i_enable_volume_viz and not na(current_period_total_volume) and not na(previous_period_total_volume) and previous_period_total_volume > 0
+    // Intensity is a value from 0 (no volume) to 1 (high volume)
+    // Compare current period volume to previous period volume
+    float volume_ratio = current_period_total_volume / previous_period_total_volume
+    float sensitivity_factor = (101 - i_volume_viz_sensitivity) / 100.0 // From 0.01 to 1.0
+    float intensity = math.min(volume_ratio * sensitivity_factor, 1.0)
+    dynamic_fill_color := color.from_gradient(intensity, 0, 1, color.new(color.blue, 90), color.new(color.purple, 70))
+
 lower_plot = plot(lower, title="Lower Band", color=color_active_range_border, style=plot.style_line)
 upper_plot = plot(upper, title="Upper Band", color=color_active_range_border, style=plot.style_line)
-fill(lower_plot, upper_plot, color=color_active_range_fill, title="Active Range Fill")
+fill(lower_plot, upper_plot, color=dynamic_fill_color, title="Active Range Fill")
 plot(middle, title="Middle", color=color_active_range_border, style=plot.style_linebr)
 plot(entry_price_on_rebalance, title="Entry Price", color=color.new(color.purple, 0), style=plot.style_linebr, linewidth=2)
-
-// Fibonacci Levels
-plot(fib236, title="Fib 23.6%", color=color_fib, style=plot.style_linebr)
-plot(fib382, title="Fib 38.2%", color=color_fib, style=plot.style_linebr)
-plot(fib618, title="Fib 61.8%", color=color_fib, style=plot.style_linebr)
-plot(fib786, title="Fib 78.6%", color=color_fib, style=plot.style_linebr)
 
 // Preview Range
 preview_lower_plot = plot(i_show_preview_range ? preview_lower : na, title="Preview Lower", color=color_preview_range_border, style=plot.style_line, linewidth=1)
 preview_upper_plot = plot(i_show_preview_range ? preview_upper : na, title="Preview Upper", color=color_preview_range_border, style=plot.style_line, linewidth=1)
 plot(i_show_preview_range ? preview_middle : na, title="Preview Middle", color=color_preview_range_border, style=plot.style_line, linewidth=1)
-fill(preview_lower_plot, preview_upper_plot, color=color_preview_range_fill, title="Preview Range Fill")
+fill(preview_lower_plot, preview_upper_plot, color=i_show_preview_range ? color_preview_range_fill : na, title="Preview Range Fill")
+
+// Plot S/R Levels
+var float sr1_level = float(na), sr1_upper = float(na), sr1_lower = float(na)
+var float sr2_level = float(na), sr2_upper = float(na), sr2_lower = float(na)
+var float sr3_level = float(na), sr3_upper = float(na), sr3_lower = float(na)
+var float sr4_level = float(na), sr4_upper = float(na), sr4_lower = float(na)
+var float sr5_level = float(na), sr5_upper = float(na), sr5_lower = float(na)
+
+if i_enable_sr
+    [s1_level, s1_upper, s1_lower] = f_plot_sr_level(i_sr_level_1, i_sr_buffer_pct)
+    sr1_level := s1_level
+    sr1_upper := s1_upper
+    sr1_lower := s1_lower
+
+    [s2_level, s2_upper, s2_lower] = f_plot_sr_level(i_sr_level_2, i_sr_buffer_pct)
+    sr2_level := s2_level
+    sr2_upper := s2_upper
+    sr2_lower := s2_lower
+
+    [s3_level, s3_upper, s3_lower] = f_plot_sr_level(i_sr_level_3, i_sr_buffer_pct)
+    sr3_level := s3_level
+    sr3_upper := s3_upper
+    sr3_lower := s3_lower
+
+    [s4_level, s4_upper, s4_lower] = f_plot_sr_level(i_sr_level_4, i_sr_buffer_pct)
+    sr4_level := s4_level
+    sr4_upper := s4_upper
+    sr4_lower := s4_lower
+
+    [s5_level, s5_upper, s5_lower] = f_plot_sr_level(i_sr_level_5, i_sr_buffer_pct)
+    sr5_level := s5_level
+    sr5_upper := s5_upper
+    sr5_lower := s5_lower
+else
+    sr1_level := na
+    sr1_upper := na
+    sr1_lower := na
+
+    sr2_level := na
+    sr2_upper := na
+    sr2_lower := na
+
+    sr3_level := na
+    sr3_upper := na
+    sr3_lower := na
+
+    sr4_level := na
+    sr4_upper := na
+    sr4_lower := na
+
+    sr5_level := na
+    sr5_upper := na
+    sr5_lower := na
+
+// Plotting for SR1
+plot(sr1_level, color=color.new(color.red, 70), style=plot.style_line, linewidth=1, title="S/R Level 1")
+plot(sr1_upper, color=color.new(color.red, 70), style=plot.style_line, linewidth=1, show_last=1, title="S/R 1 Buffer Upper")
+plot(sr1_lower, color=color.new(color.red, 70), style=plot.style_line, linewidth=1, show_last=1, title="S/R 1 Buffer Lower")
+fill(plot(sr1_upper), plot(sr1_lower), color=color.new(color.red, 90), title="S/R 1 Buffer Fill")
+
+// Plotting for SR2
+plot(sr2_level, color=color.new(color.green, 70), style=plot.style_line, linewidth=1, title="S/R Level 2")
+plot(sr2_upper, color=color.new(color.green, 70), style=plot.style_line, linewidth=1, show_last=1, title="S/R 2 Buffer Upper")
+plot(sr2_lower, color=color.new(color.green, 70), style=plot.style_line, linewidth=1, show_last=1, title="S/R 2 Buffer Lower")
+fill(plot(sr2_upper), plot(sr2_lower), color=color.new(color.green, 90), title="S/R 2 Buffer Fill")
+
+// Plotting for SR3
+plot(sr3_level, color=color.new(color.blue, 70), style=plot.style_line, linewidth=1, title="S/R Level 3")
+plot(sr3_upper, color=color.new(color.blue, 70), style=plot.style_line, linewidth=1, show_last=1, title="S/R 3 Buffer Upper")
+plot(sr3_lower, color=color.new(color.blue, 70), style=plot.style_line, linewidth=1, show_last=1, title="S/R 3 Buffer Lower")
+fill(plot(sr3_upper), plot(sr3_lower), color=color.new(color.blue, 90), title="S/R 3 Buffer Fill")
+
+// Plotting for SR4
+plot(sr4_level, color=color.new(color.orange, 70), style=plot.style_line, linewidth=1, title="S/R Level 4")
+plot(sr4_upper, color=color.new(color.orange, 70), style=plot.style_line, linewidth=1, show_last=1, title="S/R 4 Buffer Upper")
+plot(sr4_lower, color=color.new(color.orange, 70), style=plot.style_line, linewidth=1, show_last=1, title="S/R 4 Buffer Lower")
+fill(plot(sr4_upper), plot(sr4_lower), color=color.new(color.orange, 90), title="S/R 4 Buffer Fill")
+
+// Plotting for SR5
+plot(sr5_level, color=color.new(color.purple, 70), style=plot.style_line, linewidth=1, title="S/R Level 5")
+plot(sr5_upper, color=color.new(color.purple, 70), style=plot.style_line, linewidth=1, show_last=1, title="S/R 5 Buffer Upper")
+plot(sr5_lower, color=color.new(color.purple, 70), style=plot.style_line, linewidth=1, show_last=1, title="S/R 5 Buffer Lower")
+fill(plot(sr5_upper), plot(sr5_lower), color=color.new(color.purple, 90), title="S/R 5 Buffer Fill")
+plot(i_show_volume_bars ? volume : na, title="Volume Bars", style=plot.style_columns, color=color.new(color.gray, 70), histbase=0, linewidth=1)
 
 // --- Table Display ---
-var table info_table = table.new(i_table_position, 2, 8, border_width=1)
+var table info_table = table.new(i_table_position, 2, 11, border_width=1)
 
 if barstate.islast
     // Determine Status
@@ -235,3 +505,35 @@ if barstate.islast
     avg_duration_str = na(avg_duration_secs) ? "N/A" : f_format_duration(avg_duration_secs, i_duration_display_unit)
     table.cell(info_table, 0, 7, "Avg. Duration", text_halign=text.align_left)
     table.cell(info_table, 1, 7, avg_duration_str, text_halign=text.align_right)
+    
+    // Cumulative Volume
+    table.cell(info_table, 0, 8, "Range Volume", text_halign=text.align_left)
+    table.cell(info_table, 1, 8, f_format_volume(cumulativeVolumeSinceRebalance), text_halign=text.align_right)
+
+    // Volume Comparison
+    string volume_comp_text = "N/A"
+    if not na(current_period_total_volume) and not na(previous_period_total_volume) and previous_period_total_volume > 0
+        volume_comp_text := str.tostring(math.round(current_period_total_volume / previous_period_total_volume * 100, 1)) + "% of Prev"
+    table.cell(info_table, 0, 9, "Vol Comp", text_halign=text.align_left)
+    table.cell(info_table, 1, 9, volume_comp_text, text_halign=text.align_right)
+
+    // S/R Status
+    string sr_status_text = "Disabled"
+    color sr_status_color = color.gray
+    if i_enable_sr
+        sr_status_text := "Active"
+        sr_status_color := color.green
+        bool in_any_sr_zone = false
+        if f_is_price_in_sr_zone(close, i_sr_level_1, i_sr_buffer_pct) or
+           f_is_price_in_sr_zone(close, i_sr_level_2, i_sr_buffer_pct) or
+           f_is_price_in_sr_zone(close, i_sr_level_3, i_sr_buffer_pct) or
+           f_is_price_in_sr_zone(close, i_sr_level_4, i_sr_buffer_pct) or
+           f_is_price_in_sr_zone(close, i_sr_level_5, i_sr_buffer_pct)
+            in_any_sr_zone := true
+        
+        if in_any_sr_zone
+            sr_status_text := "In S/R Zone"
+            sr_status_color := color.orange
+
+    table.cell(info_table, 0, 9, "Manual S/R", text_halign=text.align_left, bgcolor=sr_status_color)
+    table.cell(info_table, 1, 9, sr_status_text, text_halign=text.align_right, bgcolor=sr_status_color)
